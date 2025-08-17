@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import os
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 
 from config import BOT_TOKEN, DIALOGS_FOLDER, OPENAI_API_KEY
@@ -25,10 +26,42 @@ dialog_logger = DialogLogger(DIALOGS_FOLDER)
 # Словарь для отслеживания активных диалогов
 active_dialogs = {}
 
+# Словарь для отслеживания пользователей, ожидающих отзыв
+waiting_for_feedback = {}
+
 # Настройки таймаута
 TIMEOUT_MINUTES = 10
 CLEANUP_INTERVAL_SECONDS = 60  # Проверяем каждую минуту
 
+# Создаем клавиатуру с кнопкой остановки диалога
+def get_stop_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Остановить диалог", callback_data="stop_dialog")]
+    ])
+    return keyboard
+
+@dp.callback_query(lambda c: c.data == "stop_dialog")
+async def process_stop_dialog_callback(callback_query: types.CallbackQuery):
+    """Обработчик нажатия кнопки остановки диалога"""
+    user_id = callback_query.from_user.id
+    
+    # Завершаем диалог
+    json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="button_stop")
+    if json_filepath:
+        logger.info(f"Диалог пользователя {user_id} завершен через кнопку и сохранен в {json_filepath}")
+    if docx_filepath:
+        logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
+    
+    # Удаляем из активных диалогов
+    if user_id in active_dialogs:
+        del active_dialogs[user_id]
+    
+    # Отправляем запрос на отзыв
+    await callback_query.message.answer("🎯 Диалог завершен! Пожалуйста, напишите ваш отзыв о работе бота:")
+    waiting_for_feedback[user_id] = True
+    
+    # Отвечаем на callback
+    await callback_query.answer("Диалог остановлен")
 
 
 async def cleanup_inactive_dialogs():
@@ -43,19 +76,22 @@ async def cleanup_inactive_dialogs():
                     logger.info(f"Завершение неактивного диалога пользователя {user_id} (таймаут {TIMEOUT_MINUTES} минут)")
                     
                     # Завершаем диалог
-                    filepath = dialog_logger.finish_dialog(user_id, reason="timeout")
-                    if filepath:
-                        logger.info(f"Диалог пользователя {user_id} сохранен в {filepath}")
+                    json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="timeout")
+                    if json_filepath:
+                        logger.info(f"Диалог пользователя {user_id} сохранен в {json_filepath}")
+                    if docx_filepath:
+                        logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
                     
                     # Удаляем из активных диалогов
                     del active_dialogs[user_id]
                     
-                    # Отправляем уведомление пользователю (опционально)
+                    # Отправляем уведомление пользователю и запрос на отзыв
                     try:
                         await bot.send_message(
                             user_id, 
-                            f"Диалог автоматически завершен из-за неактивности ({TIMEOUT_MINUTES} минут). Используйте /start для начала нового диалога."
+                            f"Диалог автоматически завершен из-за неактивности ({TIMEOUT_MINUTES} минут). Пожалуйста, напишите ваш отзыв о работе бота:"
                         )
+                        waiting_for_feedback[user_id] = True
                     except Exception as e:
                         logger.warning(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
             
@@ -74,7 +110,7 @@ async def cmd_start(message: Message):
     # Приветственное сообщение
     welcome_text = """Этот бот предназначен для тестирования промта нейропродажника, проведите с ботом ролевой диалог в котором вы выступаете в качестве HR специалиста или работника кадров"""
     
-    await message.answer(welcome_text)
+    await message.answer(welcome_text, reply_markup=get_stop_keyboard())
     
     # Отмечаем начало диалога
     active_dialogs[user_id] = True
@@ -97,7 +133,7 @@ async def cmd_start(message: Message):
     # Логируем первое сообщение (response уже содержит только текст для пользователя)
     dialog_logger.add_message(user_id, "начало диалога", response, agent_communication)
     
-    await message.answer(response)
+    await message.answer(response, reply_markup=get_stop_keyboard())
 
 @dp.message()
 async def handle_message(message: Message):
@@ -105,38 +141,94 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     user_message = message.text
     
+    # Проверяем, ожидается ли отзыв от пользователя
+    if user_id in waiting_for_feedback:
+        # Сохраняем отзыв в DOCX файл
+        try:
+            feedback_saved = dialog_logger.add_feedback_to_docx(user_id, user_message)
+            if feedback_saved:
+                await message.answer("✅ Спасибо за ваш отзыв! Он сохранен в истории диалога.")
+            else:
+                await message.answer("⚠️ Не удалось сохранить отзыв, но спасибо за обратную связь!")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении отзыва: {e}")
+            await message.answer("⚠️ Произошла ошибка при сохранении отзыва, но спасибо за обратную связь!")
+        
+        # Удаляем из ожидающих отзыв
+        del waiting_for_feedback[user_id]
+        
+        # Отправляем DOCX файл пользователю
+        try:
+            docx_filepath = dialog_logger.get_latest_docx_path(user_id)
+            if docx_filepath and os.path.exists(docx_filepath):
+                with open(docx_filepath, 'rb') as docx_file:
+                    await message.answer_document(
+                        types.BufferedInputFile(
+                            docx_file.read(),
+                            filename=f"dialog_{user_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.docx"
+                        ),
+                        caption="📄 История вашего диалога с нейропродажником (включая ваш отзыв)"
+                    )
+            else:
+                await message.answer("📄 DOCX файл с историей диалога будет доступен позже.")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке DOCX файла: {e}")
+            await message.answer("📄 История диалога сохранена, но возникла проблема с отправкой файла.")
+        
+        # Предлагаем пройти переписку еще раз
+        await message.answer("🎯 Хотите пройти переписку еще раз? Нажмите /start для начала нового диалога.")
+        return
+    
     # Проверяем, активен ли диалог
     if user_id not in active_dialogs:
         await message.answer("Пожалуйста, начните диалог с команды /start")
         return
     
     try:
+        # Проверяем, не написал ли пользователь "стоп"
+        if user_message.lower().strip() == "стоп":
+            # Завершаем диалог
+            json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="user_stop")
+            if json_filepath:
+                logger.info(f"Диалог пользователя {user_id} завершен по команде 'стоп' и сохранен в {json_filepath}")
+            if docx_filepath:
+                logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
+            
+            # Удаляем из активных диалогов
+            if user_id in active_dialogs:
+                del active_dialogs[user_id]
+            
+            # Отправляем запрос на отзыв
+            await message.answer("🎯 Диалог завершен! Пожалуйста, напишите ваш отзыв о работе бота:")
+            waiting_for_feedback[user_id] = True
+            return
+        
         # Обрабатываем сообщение через нейропродажника с GPT
         response, agent_communication = neuro_salesman.process_message(user_id, user_message)
         
         # Логируем сообщение (response уже содержит только текст для пользователя)
         dialog_logger.add_message(user_id, user_message, response, agent_communication)
         
-        # Отправляем ответ пользователю (response уже содержит только текст)
-        await message.answer(response)
+        # Отправляем ответ пользователю с кнопкой остановки
+        await message.answer(response, reply_markup=get_stop_keyboard())
         
         # Проверяем, не завершился ли диалог (например, пользователь согласился на покупку)
-        if ("оформляем доступ" in response.lower() or "оплата" in response.lower() or 
-            "спасибо за общение" in response.lower() or "до связи" in response.lower() or
-            "удачного дня" in response.lower() or "до свидания" in response.lower()):
+        # Используем только слово "стоп" для завершения диалога
+        if "стоп" in response.lower():
             # Завершаем диалог
-            filepath = dialog_logger.finish_dialog(user_id, reason="success")
-            if filepath:
-                logger.info(f"Диалог пользователя {user_id} сохранен в {filepath}")
-            else:
-                logger.error(f"Не удалось сохранить диалог пользователя {user_id}")
+            json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="success")
+            if json_filepath:
+                logger.info(f"Диалог пользователя {user_id} сохранен в {json_filepath}")
+            if docx_filepath:
+                logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
             
             # Удаляем из активных диалогов
             if user_id in active_dialogs:
                 del active_dialogs[user_id]
             
-            # Предлагаем пройти переписку еще раз
-            await message.answer("🎯 Отличная работа! Хотите пройти переписку еще раз? Нажмите /start для начала нового диалога.")
+            # Отправляем запрос на отзыв
+            await message.answer("🎯 Диалог завершен! Пожалуйста, напишите ваш отзыв о работе бота:")
+            waiting_for_feedback[user_id] = True
                 
     except Exception as e:
         logger.error(f"Ошибка при обработке сообщения: {e}")
@@ -148,9 +240,11 @@ async def cmd_stop(message: Message):
     user_id = message.from_user.id
     
     # Всегда пытаемся завершить диалог, даже если его нет в active_dialogs
-    filepath = dialog_logger.finish_dialog(user_id, reason="manual")
-    if filepath:
-        logger.info(f"Диалог пользователя {user_id} сохранен в {filepath}")
+    json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="manual")
+    if json_filepath:
+        logger.info(f"Диалог пользователя {user_id} сохранен в {json_filepath}")
+    if docx_filepath:
+        logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
     else:
         # Проверяем, есть ли диалог в логгере
         summary = dialog_logger.get_dialog_summary(user_id)
@@ -161,8 +255,9 @@ async def cmd_stop(message: Message):
     if user_id in active_dialogs:
         del active_dialogs[user_id]
     
-    # Предлагаем пройти переписку еще раз
-    await message.answer("🎯 Диалог завершен! Хотите пройти переписку еще раз? Нажмите /start для начала нового диалога.")
+    # Отправляем запрос на отзыв
+    await message.answer("🎯 Диалог завершен! Пожалуйста, напишите ваш отзыв о работе бота:")
+    waiting_for_feedback[user_id] = True
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
@@ -196,6 +291,8 @@ ID пользователя: {summary['user_id']}
             await message.answer(status_text)
         else:
             await message.answer("Диалог активен, но информация недоступна")
+    elif user_id in waiting_for_feedback:
+        await message.answer("⏳ Ожидается ваш отзыв о работе бота. Пожалуйста, напишите ваш отзыв.")
     else:
         await message.answer("Активный диалог не найден")
 
@@ -236,9 +333,11 @@ async def cmd_reset(message: Message):
     # Сбрасываем диалог
     neuro_salesman.reset_conversation(user_id)
     
-    # Удаляем из активных диалогов
+    # Удаляем из активных диалогов и ожидающих отзыв
     if user_id in active_dialogs:
         del active_dialogs[user_id]
+    if user_id in waiting_for_feedback:
+        del waiting_for_feedback[user_id]
     
     await message.answer("Диалог сброшен. Используйте /start для начала нового диалога.")
 
@@ -260,9 +359,11 @@ async def cmd_finish(message: Message):
     user_id = message.from_user.id
     
     # Завершаем диалог пользователя
-    filepath = dialog_logger.finish_dialog(user_id, reason="force_finish")
-    if filepath:
-        logger.info(f"Диалог пользователя {user_id} принудительно завершен и сохранен в {filepath}")
+    json_filepath, docx_filepath = dialog_logger.finish_dialog(user_id, reason="force_finish")
+    if json_filepath:
+        logger.info(f"Диалог пользователя {user_id} принудительно завершен и сохранен в {json_filepath}")
+    if docx_filepath:
+        logger.info(f"DOCX файл пользователя {user_id} создан: {docx_filepath}")
     else:
         logger.info(f"Диалог для завершения не найден для пользователя {user_id}")
     
@@ -270,8 +371,9 @@ async def cmd_finish(message: Message):
     if user_id in active_dialogs:
         del active_dialogs[user_id]
     
-    # Предлагаем пройти переписку еще раз
-    await message.answer("🎯 Диалог завершен! Хотите пройти переписку еще раз? Нажмите /start для начала нового диалога.")
+    # Отправляем запрос на отзыв
+    await message.answer("🎯 Диалог завершен! Пожалуйста, напишите ваш отзыв о работе бота:")
+    waiting_for_feedback[user_id] = True
 
 @dp.message(Command("debug"))
 async def cmd_debug(message: Message):

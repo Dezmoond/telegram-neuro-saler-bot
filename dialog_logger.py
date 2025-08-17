@@ -2,12 +2,14 @@ import json
 import os
 from datetime import datetime, timedelta
 from typing import Dict, List
+from docx_generator import DocxGenerator
 
 class DialogLogger:
     def __init__(self, dialogs_folder: str = "dialogs"):
         self.dialogs_folder = dialogs_folder
         if not os.path.exists(dialogs_folder):
             os.makedirs(dialogs_folder)
+        self.docx_generator = DocxGenerator()
     
     def save_dialog(self, user_id: int, dialog_data: Dict) -> str:
         """Сохраняет диалог в файл"""
@@ -73,22 +75,25 @@ class DialogLogger:
         self.current_dialogs[user_id]["messages"].append(message_data)
         self.current_dialogs[user_id]["last_activity"] = datetime.now()  # Обновляем время активности
     
-    def finish_dialog(self, user_id: int, reason: str = "manual") -> str:
+    def finish_dialog(self, user_id: int, reason: str = "manual") -> tuple:
         """Завершает диалог и сохраняет его в файл"""
         if not hasattr(self, 'current_dialogs') or user_id not in self.current_dialogs:
-            return None
+            return None, None
         
         dialog = self.current_dialogs[user_id].copy()  # Создаем копию
         dialog["end_time"] = datetime.now().isoformat()
         dialog["finish_reason"] = reason  # Добавляем причину завершения
         
-        # Сохраняем диалог
-        filepath = self.save_dialog(user_id, dialog)
+        # Сохраняем JSON
+        json_filepath = self.save_dialog(user_id, dialog)
+        
+        # Создаем DOCX
+        docx_filepath = self.docx_generator.create_dialog_docx(user_id, dialog)
         
         # Удаляем из текущих диалогов
         del self.current_dialogs[user_id]
         
-        return filepath
+        return json_filepath, docx_filepath
     
     def get_dialog_summary(self, user_id: int) -> Dict:
         """Возвращает краткую информацию о текущем диалоге"""
@@ -127,8 +132,49 @@ class DialogLogger:
         saved_files = []
         
         for user_id in inactive_users:
-            filepath = self.finish_dialog(user_id, reason="timeout")
-            if filepath:
-                saved_files.append(filepath)
+            json_filepath, docx_filepath = self.finish_dialog(user_id, reason="timeout")
+            if json_filepath:
+                saved_files.append(json_filepath)
+            if docx_filepath:
+                saved_files.append(docx_filepath)
         
-        return saved_files 
+        return saved_files
+    
+    def add_feedback_to_docx(self, user_id: int, feedback: str) -> bool:
+        """Добавляет отзыв пользователя в DOCX файл"""
+        try:
+            # Ищем последний DOCX файл для этого пользователя
+            docx_filepath = self.get_latest_docx_path(user_id)
+            if not docx_filepath or not os.path.exists(docx_filepath):
+                return False
+            
+            # Добавляем отзыв в DOCX файл
+            return self.docx_generator.add_feedback_to_docx(docx_filepath, feedback)
+        except Exception as e:
+            print(f"Ошибка при добавлении отзыва в DOCX: {e}")
+            return False
+    
+    def get_latest_docx_path(self, user_id: int) -> str:
+        """Возвращает путь к последнему DOCX файлу пользователя"""
+        try:
+            # Ищем в папке dialogs_docx файлы для данного пользователя
+            docx_folder = "dialogs_docx"
+            if not os.path.exists(docx_folder):
+                return None
+            
+            # Ищем файлы с именем пользователя
+            user_files = []
+            for filename in os.listdir(docx_folder):
+                if filename.startswith(f"dialog_{user_id}_") and filename.endswith('.docx'):
+                    filepath = os.path.join(docx_folder, filename)
+                    user_files.append((filepath, os.path.getmtime(filepath)))
+            
+            if not user_files:
+                return None
+            
+            # Возвращаем самый новый файл
+            latest_file = max(user_files, key=lambda x: x[1])
+            return latest_file[0]
+        except Exception as e:
+            print(f"Ошибка при поиске DOCX файла: {e}")
+            return None 

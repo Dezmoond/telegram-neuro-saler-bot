@@ -57,6 +57,7 @@ logs/
 
 # Dialogs (опционально - можно включить для демонстрации)
 # dialogs/
+# dialogs_docx/
 
 # Jupyter Notebook
 .ipynb_checkpoints
